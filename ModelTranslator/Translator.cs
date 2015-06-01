@@ -3,8 +3,6 @@
     using System;
     using System.Collections.Generic;
     using System.Linq;
-    using System.Management.Instrumentation;
-    using System.Text;
     using System.Text.RegularExpressions;
 
     using Microsoft.CodeAnalysis;
@@ -12,6 +10,7 @@
     using Microsoft.CodeAnalysis.CSharp.Syntax;
 
     using ModelTranslator.Model;
+    using ModelTranslator.Utils;
 
 
     class Translator
@@ -115,13 +114,8 @@
             var methods = classNode.DescendantNodes()
                                    .OfType<MethodDeclarationSyntax>();
 
-            var restrictedNames = new[] { "Dispose", "Equals", "GetHashCode", "ObjectInvariant" };
-
             foreach (var method in methods)
             {
-                if (restrictedNames.Contains(method.Identifier.Text))
-                    continue;
-
                 var args = method.ParameterList.Parameters;
                 yield return new MethodModel
                 {
@@ -142,10 +136,8 @@
         }
 
         /// <summary>
-        /// tot 
+        /// Returns the constructor definition.
         /// </summary>
-        /// <param name="classNode"></param>
-        /// <returns></returns>
         private ConstructorModel ParseConstructor(ClassDeclarationSyntax classNode)
         {
             var ctorNode = classNode.DescendantNodes()
@@ -166,7 +158,6 @@
                     Type = x.Type.ToString(),
                     InitializerCode = x.Default != null ? x.Default.Value.ToString() : null
                 })
-                .Where(x => x.Type != "ILogService")
                 .ToList(),
 
                 BaseCall = baseCallArgs.Select(x => new ArgumentModel { Name = x.Expression.ToString() }).ToList(),
@@ -202,6 +193,20 @@
             return rawValue;
         }
 
+        /// <summary>
+        /// Removes descriptions for inexistant arguments.
+        /// </summary>
+        private string CleanUpComment(string comment, IEnumerable<string> restrictedArgs)
+        {
+            return restrictedArgs.Aggregate(
+                comment,
+                (current, restrictedArg) => new Regex(
+                    string.Format(@"/// <param name=""{0}"">(.+?)</param>\n?", restrictedArg),
+                    RegexOptions.Singleline
+                ).Replace(current, "")
+            );
+        }
+
         #endregion
 
         #region Name translation
@@ -225,9 +230,10 @@
             return name;
         }
 
-        private readonly Regex ListTypeConvention = new Regex("^List<(?<name>.+)>$", RegexOptions.Compiled);
-        private readonly Regex SubjectTypeConvention = new Regex("^Subject<(?<name>.+)>$", RegexOptions.Compiled);
-        private readonly Regex GenericTypeConvention = new Regex("^(?<type>[a-z][a-z0-9]*)<(?<name>.+)>$", RegexOptions.Compiled);
+        private readonly Regex ListTypeConvention = new Regex(@"^List<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
+        private readonly Regex SubjectTypeConvention = new Regex(@"^Subject<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
+        private readonly Regex GenericTypeConvention = new Regex(@"^(?<type>[a-z][a-z0-9]*)<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
+        private readonly Regex InitializerNewObjectConvention = new Regex(@"new (?<type>.+)\s\((?<args>.*)\)", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
 
         private readonly Dictionary<string, string> BasicTypes = new Dictionary<string, string>
         {
@@ -262,6 +268,18 @@
             return type;
         }
 
+        /// <summary>
+        /// Attempts to translate initializers.
+        /// </summary>
+        private string ApplyInitializerConvention(string value)
+        {
+            var initMatch = InitializerNewObjectConvention.Match(value);
+            if (initMatch.Success)
+                return string.Format("new {0} ({1})", ApplyTypeConvention(initMatch.Groups["type"].Value), initMatch.Groups["args"].Value);
+
+            return value;
+        }
+
         #endregion
 
         #region Render model to typescript
@@ -273,19 +291,29 @@
         {
             var sb = new SourceBuilder();
 
-            // class <X> [extends <Y>] [implements <Z1, Z2, ...>] {
-            sb.AppendFormat("class {0} ", model.Name);
-            if (!string.IsNullOrEmpty(model.BaseType))
-                sb.AppendFormat("extends {0} ", model.BaseType);
-            if (model.Interfaces.Any())
-                sb.AppendFormat("implements {0} ", string.Join(", ", model.Interfaces));
+            using (var line = sb.Line())
+            {
+                // class <X> [extends <Y>] [implements <Z1, Z2, ...>] {
+                line.Append("class {0}", model.Name);
+                if (!string.IsNullOrEmpty(model.BaseType))
+                    line.Append("extends {0}", model.BaseType);
+                if (model.Interfaces.Any())
+                    line.Append("implements {0}", string.Join(", ", model.Interfaces));
+            }
 
             using (sb.NestedBlock())
             {
                 if (!string.IsNullOrEmpty(model.Comment))
-                    sb.Append(model.Comment);
+                    using(sb.SpacedBlock())
+                        sb.Append(model.Comment);
 
                 AppendFields(sb, model);
+                AppendConstructor(sb, model);
+                AppendProperties(sb, model);
+                AppendEvents(sb, model);
+                AppendMethods(sb, model);
+                AppendDisposableBlock(sb, model);
+                AppendEquatableBlock(sb, model);
             }
 
             return sb.ToString();
@@ -306,20 +334,229 @@
             }
 
             var restrictions = new Func<FieldModel, bool>[] { x => x.Name == "_isDisposed", x => x.Type == "ILogService" };
-            var allFields = fieldsLookup.Where(x => !restrictions.Any(y => y(x.Value))).Select(x => x.Value).ToList();
+            var allFields = fieldsLookup.Values.Restrict(restrictions).ToList();
 
             if (!fieldsLookup.Any())
                 return;
 
-            sb.AppendRegion("Fields");
+            sb.AppendRegionHeader("Fields");
 
             foreach (var field in allFields.OrderBy(x => x.Name))
             {
-                sb.AppendLine();
-                sb.AppendLine("// " + GetCommentSummary(field.Comment));
-                sb.AppendFormat("private {0}: {1};", ApplyNameConvention(field.Name, true), ApplyTypeConvention(field.Type));
-                sb.AppendLine();
+                using (sb.SpacedBlock())
+                {
+                    sb.Append("// " + GetCommentSummary(field.Comment));
+                    sb.Append("private {0}: {1};", ApplyNameConvention(field.Name, true), ApplyTypeConvention(field.Type));
+                }
             }
+        }
+
+        /// <summary>
+        /// Creates a default constructor body.
+        /// </summary>
+        private void AppendConstructor(SourceBuilder sb, ClassModel model)
+        {
+            sb.AppendRegionHeader("Constructor");
+
+            var restrictions = new Func<ArgumentModel, bool>[] { x => x.Type == "ILogService" };
+            var argDefs = model.Constructor.Arguments.Restrict(restrictions).ToList();
+            sb.Append("constructor ({0}) ", BuildArgumentList(argDefs));
+
+            using (sb.NestedBlock())
+            {
+                // documentation comment
+                var restrictedArgs = model.Constructor.Arguments.Where(x => !argDefs.Any(y => y.Name == x.Name)).Select(x => x.Name);
+                using(sb.SpacedBlock())
+                    sb.Append(CleanUpComment(model.Constructor.Comment, restrictedArgs));
+
+                // base call
+                if (model.Constructor.BaseCall.Count > 0)
+                {
+                    var baseCallArgs = model.Constructor.BaseCall.Select(x => x.Name);
+                    using(sb.SpacedBlock())
+                        sb.Append("super({0});", string.Join(", ", baseCallArgs));
+                }
+
+                // todo: contracts?
+
+                // default values for fields
+                using (sb.SpacedBlock())
+                foreach (var field in model.Fields)
+                {
+                    if (string.IsNullOrEmpty(field.InitializerCode))
+                        continue;
+
+                    sb.Append("this.{0} = {1};", ApplyNameConvention(field.Name, true), ApplyInitializerConvention(field.InitializerCode));
+                }
+
+                // field init
+                using (sb.SpacedBlock())
+                foreach (var arg in argDefs)
+                {
+                    if (model.Fields.Any(x => ApplyNameConvention(x.Name, true) == "_" + arg.Name) || model.Properties.Any(x => ApplyNameConvention(x.Name, false) == arg.Name))
+                        sb.Append("this._{0} = {0};", arg.Name);
+                }
+
+                using (sb.SpacedBlock())
+                sb.Append("// TODO: custom initialization code here");
+            }
+        }
+
+        /// <summary>
+        /// Appends the list of simple properties.
+        /// </summary>
+        private void AppendProperties(SourceBuilder sb, ClassModel model)
+        {
+            var restrictions = new Func<PropertyModel, bool>[] { x => x.Type.StartsWith("Subject") };
+            var ptys = model.Properties.Restrict(restrictions).ToList();
+        }
+
+        /// <summary>
+        /// Appends the list of event properties.
+        /// </summary>
+        private void AppendEvents(SourceBuilder sb, ClassModel model)
+        {
+            var restrictions = new Func<PropertyModel, bool>[] { x => !x.Type.StartsWith("Subject") };
+            var handlers = model.Properties.Restrict(restrictions).ToList();
+
+            if (handlers.Count == 0)
+                return;
+
+            sb.AppendRegionHeader("Event handlers");
+
+            foreach (var handler in handlers)
+            {
+                using (sb.SpacedBlock())
+                {
+                    using (var line = sb.Line())
+                    {
+                        line.Append("get {0}()", ApplyNameConvention(handler.Name, false));
+                        if(handler.Type != "void")
+                            line.Append(": {0}", ApplyTypeConvention(handler.Type));
+                    }
+
+                    using (sb.NestedBlock())
+                    {
+                        using (sb.SpacedBlock())
+                        sb.Append(handler.Comment);
+
+                        using (sb.SpacedBlock())
+                        sb.Append("return this._{0}", ApplyNameConvention(handler.Name, true));
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Appends the list of methods.
+        /// </summary>
+        private void AppendMethods(SourceBuilder sb, ClassModel model)
+        {
+            var restrictedNames = new[] { "Dispose", "Equals", "GetHashCode", "ObjectInvariant" };
+            var restrictions = new Func<MethodModel, bool>[]{ x => restrictedNames.Contains(x.Name) };
+            var methods = model.Methods.Restrict(restrictions)
+                               .GroupBy(x => x.IsPrivate && x.Type == "void" && x.Arguments.Count == 1)
+                               .ToDictionary(x => x.Key, x => x.ToList());
+
+            var regions = new Dictionary<bool, string>() { { false, "Methods" }, { true, "Event handlers" } };
+            foreach (var region in regions)
+            {
+                List<MethodModel> regionMethods;
+                if (!methods.TryGetValue(region.Key, out regionMethods) || !regionMethods.Any())
+                    continue;
+
+                sb.AppendRegionHeader(region.Value);
+
+                foreach (var method in regionMethods)
+                {
+                    using (sb.SpacedBlock())
+                    {
+                        using (var line = sb.Line())
+                        {
+                            if (method.IsPrivate)
+                                line.Append("private");
+
+                            line.Append(
+                                "{0} ({1})",
+                                method.Name,
+                                BuildArgumentList(method.Arguments)
+                            );
+
+                            if (method.Type != "void")
+                                line.Append(": {0}", ApplyTypeConvention(method.Type));
+                        }
+
+                        using (sb.NestedBlock())
+                        {
+                            using (sb.SpacedBlock())
+                            sb.Append(method.Comment);
+
+                            using (sb.SpacedBlock())
+                            sb.Append("// TODO: method body");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Appends a default "IDisposable" implementation.
+        /// </summary>
+        private void AppendDisposableBlock(SourceBuilder sb, ClassModel model)
+        {
+            if (!model.Interfaces.Contains("IDisposable"))
+                return;
+
+            sb.AppendRegionHeader("IDisposable implementation");
+
+            using (sb.SpacedBlock())
+            sb.Append("private _isDisposed: boolean;");
+
+            sb.Append("dispose()");
+            using (sb.NestedBlock())
+            {
+                sb.Append("if(this._isDisposed)");
+                using (sb.NestedBlock())
+                    sb.Append("return;");
+
+                using (sb.SpacedBlock())
+                foreach (var field in model.Fields)
+                    if (field.Type == "CompositeDisposable" || field.Type.StartsWith("IObservable"))
+                        sb.Append("this.{0}.dispose();", ApplyNameConvention(field.Name, true));
+
+                using (sb.SpacedBlock())
+                sb.Append("// TODO: custom code here");
+
+                using (sb.SpacedBlock())
+                sb.Append("this._isDisposed = true;");
+            }
+        }
+
+        /// <summary>
+        /// Appends an empty "IEquatable" implementation.
+        /// </summary>
+        private void AppendEquatableBlock(SourceBuilder sb, ClassModel model)
+        {
+            if (!model.Interfaces.Any(x => x.StartsWith("IEquatable")))
+                return;
+
+            sb.AppendRegionHeader("IEquatable implementation");
+        }
+
+        /// <summary>
+        /// Creates a comma-separated list of argument declarations.
+        /// </summary>
+        private string BuildArgumentList(IEnumerable<ArgumentModel> args)
+        {
+            var argStrings = args.Select(x => string.Format(
+                "{0}: {1}{2}",
+                x.Name,
+                ApplyTypeConvention(x.Type),
+                string.IsNullOrEmpty(x.InitializerCode)
+                    ? ""
+                    : " = " + ApplyInitializerConvention(x.InitializerCode)
+            ));
+            return string.Join(", ", argStrings);
         }
 
         #endregion

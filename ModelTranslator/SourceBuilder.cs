@@ -2,22 +2,25 @@
 {
     using System;
     using System.Collections.Generic;
+    using System.Linq;
     using System.Text;
 
 
     /// <summary>
-    /// A wrapper around StringBuilder than handles indentation.
+    /// A wrapper around StringBuilder than handles indentation and spacing.
     /// </summary>
     class SourceBuilder
     {
-        public SourceBuilder()
+        public SourceBuilder(string separator = null)
         {
-            _Builder = new StringBuilder();
             _NestingLevel = 0;
+            _Lines = new List<string>();
+            _Separator = separator ?? Environment.NewLine;
         }
 
         private int _NestingLevel;
-        private readonly StringBuilder _Builder;
+        private readonly List<string> _Lines;
+        private readonly string _Separator;
 
         /// <summary>
         /// Returns a Disposable nested block.
@@ -28,50 +31,80 @@
         }
 
         /// <summary>
-        /// Appends the string.
+        /// Returns a disposable spaced block.
+        /// </summary>
+        public IDisposable SpacedBlock()
+        {
+            return new SourceBuilderSpacer(this);
+        }
+
+        /// <summary>
+        /// Builds a line.
+        /// </summary>
+        public SourceLineBuilder Line()
+        {
+            return new SourceLineBuilder(this);
+        }
+
+        /// <summary>
+        /// Appends a line of code (or several) with padding applied.
         /// </summary>
         public void Append(string str)
         {
-            foreach(var line in ProcessString(str))
-                _Builder.Append(line);
+            foreach (var line in ProcessString(str))
+                _Lines.Add(line);
         }
 
         /// <summary>
-        /// Appends the string with formatting.
+        /// Appends a formatted line of code (or several) with padding applied.
         /// </summary>
-        public void AppendFormat(string str, params object[] args)
+        public void Append(string str, params object[] args)
         {
-            foreach (var line in ProcessString(string.Format(str, args)))
-                _Builder.Append(line);
-        }
-
-        /// <summary>
-        /// Appends the string with trailing newline.
-        /// </summary>
-        public void AppendLine(string str = null)
-        {
-            Append(str);
-            _Builder.AppendLine();
+            var actualStr = string.Format(str, args);
+            foreach (var line in ProcessString(actualStr))
+                _Lines.Add(line);
         }
 
         /// <summary>
         /// Appends a preformatted region.
         /// </summary>
-        public void AppendRegion(string regionName)
+        public void AppendRegionHeader(string regionName)
         {
-            AppendLine();
-            AppendLine();
-            AppendLine("// -----------------------------------");
-            AppendLine("// " + regionName);
-            AppendLine("// -----------------------------------");
+            using (SpacedBlock())
+            {
+                Append("// -----------------------------------");
+                Append("// {0}", regionName);
+                Append("// -----------------------------------");
+            }
         }
 
         /// <summary>
-        /// Compiles the source to string.
+        /// Compiles the source to string, crunching empty lines.
         /// </summary>
         public override string ToString()
         {
-            return _Builder.ToString();
+            var sb = new StringBuilder();
+            var isLastEmpty = false;
+            for(var i = 0; i < _Lines.Count; i++)
+            {
+                var line = _Lines[i];
+                var isCurrentEmpty = string.IsNullOrWhiteSpace(line);
+                if (!isCurrentEmpty || !isLastEmpty)
+                {
+                    sb.Append(line);
+
+                    if (_Lines.Count > i + 1)
+                    {
+                        // special case: pull opening brace onto current line
+                        var nextLine = _Lines[i + 1];
+                        sb.Append(nextLine.Trim() != "{" ? _Separator : " ");
+                    }
+                }
+
+                isLastEmpty = isCurrentEmpty;
+            }
+
+            return sb.ToString();
         }
 
         #region Nesting management
@@ -81,24 +114,14 @@
         /// </summary>
         private IEnumerable<string> ProcessString(string str)
         {
-            if(str == null)
-                yield break;
-
-            var lines = str.Split('\n');
-            var isFirst = true;
-            foreach (var line in lines)
-            {
-                if (!isFirst) yield return "\n";
-
-                for (var i = 0; i < _NestingLevel; i++)
-                    yield return "    ";
-
-                yield return line;
-
-                isFirst = false;
-            }
+            return str == null
+                ? new string[] { null }
+                : str.Split('\n').Select(line => line == "{" ? line : new string(' ', _NestingLevel * 4) + line);
         }
 
+        /// <summary>
+        /// Declares a syntactical block of code with curly braces and indentation.
+        /// </summary>
         private class SourceBuilderNester : IDisposable
         {
             public SourceBuilderNester(SourceBuilder parent)
@@ -106,21 +129,53 @@
                 _Parent = parent;
 
                 _Parent.Append("{");
-
                 _Parent._NestingLevel++;
-
-                _Parent.AppendLine();
-                _Parent.AppendLine();
             }
 
             private readonly SourceBuilder _Parent;
 
             public void Dispose()
             {
-                _Parent.AppendLine();
-                _Parent.AppendLine();
                 _Parent._NestingLevel--;
                 _Parent.Append("}");
+            }
+        }
+
+        /// <summary>
+        /// Declares a logical block of code with empty lines above and below.
+        /// </summary>
+        private class SourceBuilderSpacer : IDisposable
+        {
+            public SourceBuilderSpacer(SourceBuilder parent)
+            {
+                _Parent = parent;
+
+                _Parent.Append("");
+            }
+
+            private readonly SourceBuilder _Parent;
+
+            public void Dispose()
+            {
+                _Parent.Append("");
+            }
+        }
+
+        /// <summary>
+        /// Concatenates several pieces of a line into one.
+        /// </summary>
+        public class SourceLineBuilder : SourceBuilder, IDisposable
+        {
+            public SourceLineBuilder(SourceBuilder parent) : base(" ")
+            {
+                _Parent = parent;
+            }
+
+            private readonly SourceBuilder _Parent;
+
+            public void Dispose()
+            {
+                _Parent.Append(ToString());
             }
         }
 
