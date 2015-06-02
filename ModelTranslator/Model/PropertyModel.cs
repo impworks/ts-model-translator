@@ -9,6 +9,8 @@
         public string Type { get; set; }
 
         public bool HasSetter { get; set; }
+        public bool HasСustomSetter { get; set; }
+        public bool HasСustomGetter { get; set; }
         public List<ContractAssertionModel> SetterContractAssertions { get; set; }
     }
 }
