@@ -94,11 +94,7 @@
                     sb.Append(line);
 
                     if (_Lines.Count > i + 1)
-                    {
-                        // special case: pull opening brace onto current line
-                        var nextLine = _Lines[i + 1];
-                        sb.Append(nextLine.Trim() != "{" ? _Separator : " ");
-                    }
+                        sb.Append(_Separator);
                 }
 
                 isLastEmpty = isCurrentEmpty;
@@ -116,7 +112,7 @@
         {
             return str == null
                 ? new string[] { null }
-                : str.Split('\n').Select(line => line == "{" ? line : new string(' ', _NestingLevel * 4) + line);
+                : str.Split('\n').Select(line => new string(' ', _NestingLevel * 4) + line);
         }
 
         /// <summary>

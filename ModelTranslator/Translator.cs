@@ -189,8 +189,24 @@
             if(string.IsNullOrEmpty(comment))
                 return null;
 
-            var rawValue = CommentSummaryRegex.Match(comment).Groups["text"].Value.Replace("///", "").Replace('\n', ' ').Trim();
-            return rawValue;
+            return CommentSummaryRegex.Match(comment).Groups["text"].Value
+                                                                    .Replace("///", "")
+                                                                    .Replace('\n', ' ')
+                                                                    .Trim();
+        }
+
+        /// <summary>
+        /// Returns the summary as a single-line comment.
+        /// </summary>
+        private string SquishCommentSummary(string comment)
+        {
+            if(string.IsNullOrEmpty(comment))
+                return null;
+
+            return string.Format(
+                "/// <summary>{0}</summary>",
+                GetCommentSummary(comment).Replace("\n", " ")
+            );
         }
 
         /// <summary>
@@ -408,7 +424,37 @@
         private void AppendProperties(SourceBuilder sb, ClassModel model)
         {
             var restrictions = new Func<PropertyModel, bool>[] { x => x.Type.StartsWith("Subject") };
-            var ptys = model.Properties.Restrict(restrictions).ToList();
+            var properties = model.Properties.Restrict(restrictions).ToList();
+
+            if (properties.Count == 0)
+                return;
+
+            sb.AppendRegionHeader("Properties");
+
+            foreach (var pty in properties)
+            {
+                using (sb.SpacedBlock())
+                {
+                    sb.Append("get {0}() : {1}", ApplyNameConvention(pty.Name, false), ApplyTypeConvention(pty.Type));
+                    using (sb.NestedBlock())
+                    {
+                        using(sb.SpacedBlock())
+                        sb.Append(SquishCommentSummary(pty.Comment));
+
+                        sb.Append("return this.{0};", ApplyNameConvention(pty.Name, true));
+                    }
+                }
+
+                if (pty.HasSetter)
+                {
+                    using (sb.SpacedBlock())
+                    {
+                        sb.Append("set {0}(value: {1})", pty.Name, pty.Type);
+                        using (sb.NestedBlock())
+                            sb.Append("// TODO: setter body");
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -541,6 +587,12 @@
                 return;
 
             sb.AppendRegionHeader("IEquatable implementation");
+
+            sb.Append("equals(other: {0})", model.Name);
+            using (sb.NestedBlock())
+            {
+                sb.Append("// TODO: implement comparator here");
+            }
         }
 
         /// <summary>
