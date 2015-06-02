@@ -161,8 +161,81 @@
                 .ToList(),
 
                 BaseCall = baseCallArgs.Select(x => new ArgumentModel { Name = x.Expression.ToString() }).ToList(),
-                Comment = ParseComment(ctorNode)
+                Comment = ParseComment(ctorNode),
+                ContractAssertions = ParseContractAssertions(ctorNode.Body.Statements)
             };
+        }
+
+        #endregion
+
+        #region Contract assertions
+
+        private Dictionary<ContractAssertionKind, Regex> ContractAssertionMap = new Dictionary<ContractAssertionKind, Regex>
+        {
+            { ContractAssertionKind.IsNotNull, new Regex(@"^(?<name>[a-zA-Z0-9]+) != null", RegexOptions.Compiled | RegexOptions.ExplicitCapture) },
+            { ContractAssertionKind.GreaterThanZero, new Regex(@"^(?<name>[a-zA-Z0-9]+) > 0", RegexOptions.Compiled | RegexOptions.ExplicitCapture) },
+            { ContractAssertionKind.GreaterOrEqualThanZero, new Regex(@"^(?<name>[a-zA-Z0-9]+) >= 0", RegexOptions.Compiled | RegexOptions.ExplicitCapture) },
+            { ContractAssertionKind.CountGreaterThanZero, new Regex(@"^(?<name>[a-zA-Z0-9]+)\.Count > 0", RegexOptions.Compiled | RegexOptions.ExplicitCapture) },
+            { ContractAssertionKind.IsNotEmptyString, new Regex(@"^!string\.IsNullOr(Empty|Whitespace)\((?<name>[a-zA-Z0-9]+)\)", RegexOptions.Compiled | RegexOptions.ExplicitCapture) }
+        };
+
+        /// <summary>
+        /// Returns the list of contract assertions found in a method body.
+        /// </summary>
+        private List<ContractAssertionModel> ParseContractAssertions(SyntaxList<StatementSyntax> stmts)
+        {
+            var result = new List<ContractAssertionModel>();
+
+            foreach (var stmt in stmts)
+            {
+                ContractAssertionModel assertion = null;
+
+                try
+                {
+                    var stmtExpr = (ExpressionStatementSyntax) stmt;
+                    var invocation = (InvocationExpressionSyntax) stmtExpr.Expression;
+                    var mbrAccess = (MemberAccessExpressionSyntax) invocation.Expression;
+
+                    if(mbrAccess.ToString() != "Contract.Requires")
+                        break;
+
+                    var arg = invocation.ArgumentList.Arguments[0].Expression;
+                    var argStr = arg.ToString();
+
+                    foreach (var map in ContractAssertionMap)
+                    {
+                        var match = map.Value.Match(argStr);
+                        if (match.Success)
+                        {
+                            assertion = new ContractAssertionModel
+                            {
+                                ArgumentName = match.Groups["name"].Value,
+                                Kind = map.Key,
+                                RawExpression = argStr
+                            };
+
+                            break;
+                        }
+                    }
+
+                    if (assertion == null)
+                    {
+                        assertion = new ContractAssertionModel { Kind = ContractAssertionKind.Other, RawExpression = argStr };
+                    }
+                }
+                catch (InvalidCastException)
+                {
+                    break;
+                }
+                catch (NullReferenceException)
+                {
+                    break;
+                }
+
+                result.Add(assertion);
+            }
+
+            return result;
         }
 
         #endregion
@@ -393,7 +466,8 @@
                         sb.Append("super({0});", string.Join(", ", baseCallArgs));
                 }
 
-                // todo: contracts?
+                // contract
+                AppendContractAssertionsBlock(sb, model.Constructor.ContractAssertions);
 
                 // default values for fields
                 using (sb.SpacedBlock())
@@ -451,7 +525,11 @@
                     {
                         sb.Append("set {0}(value: {1})", pty.Name, pty.Type);
                         using (sb.NestedBlock())
+                        {
+                            AppendContractAssertionsBlock(sb, pty.SetterContractAssertions);
+
                             sb.Append("// TODO: setter body");
+                        }
                     }
                 }
             }
@@ -537,6 +615,8 @@
                             using (sb.SpacedBlock())
                             sb.Append(method.Comment);
 
+                            AppendContractAssertionsBlock(sb, method.ContractAssertions);
+
                             using (sb.SpacedBlock())
                             sb.Append("// TODO: method body");
                         }
@@ -592,6 +672,58 @@
             using (sb.NestedBlock())
             {
                 sb.Append("// TODO: implement comparator here");
+            }
+        }
+
+        /// <summary>
+        /// Appends a list of contract assertions.
+        /// </summary>
+        private void AppendContractAssertionsBlock(SourceBuilder sb, List<ContractAssertionModel> assertions)
+        {
+            var restrictions = new Func<ContractAssertionModel, bool>[] { x => x.ArgumentName == "log" };
+            var assertList = (assertions ?? new List<ContractAssertionModel>()).Restrict(restrictions).ToList();
+
+            if (!assertList.Any())
+                return;
+
+            using (sb.SpacedBlock())
+            {
+                while (assertList.Count > 0)
+                {
+                    var assert = assertList[0];
+                    if (assert.Kind == ContractAssertionKind.IsNotNull)
+                    {
+                        var arrayCounterpart = assertList.FirstOrDefault(x => x.ArgumentName == assert.ArgumentName && x.Kind == ContractAssertionKind.CountGreaterThanZero);
+
+                        if (arrayCounterpart != null)
+                        {
+                            sb.Append("Contract.requiresArray(() => {0});", assert.ArgumentName);
+                            assertList.Remove(arrayCounterpart);
+                        }
+                        else
+                        {
+                            sb.Append("Contract.requiresDefined(() => {0});", assert.ArgumentName);
+                        }
+                    }
+                    else if (assert.Kind == ContractAssertionKind.CountGreaterThanZero)
+                    {
+                        sb.Append("Contract.requires(() => {0}.length > 0);", assert.ArgumentName);
+                    }
+                    else if (assert.Kind == ContractAssertionKind.IsNotEmptyString)
+                    {
+                        sb.Append("Contract.requiresString(() => {0});", assert.ArgumentName);
+                    }
+                    else if(assert.Kind == ContractAssertionKind.GreaterThanZero || assert.Kind == ContractAssertionKind.GreaterOrEqualThanZero)
+                    {
+                        sb.Append("Contract.requires(() => {0});", assert.RawExpression);
+                    }
+                    else
+                    {
+                        sb.Append("Contract.requires(() => {0}); // TODO: check", assert.RawExpression);
+                    }
+
+                    assertList.Remove(assert);
+                }
             }
         }
 

@@ -10,5 +10,6 @@
         public bool IsPrivate { get; set; }
 
         public List<ArgumentModel> Arguments { get; set; }
+        public List<ContractAssertionModel> ContractAssertions { get; set; }
     }
 }
