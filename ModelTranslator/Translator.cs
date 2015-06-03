@@ -99,30 +99,42 @@
                 var getter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.GetKeyword);
                 var setter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.SetKeyword);
 
-                var hasCustomGetter = false;
+                AccessorKind? getterKind = null;
                 if (getter != null && getter.Body != null && getter.Body.Statements.Count == 1)
                 {
-                    hasCustomGetter = true;
+                    getterKind = AccessorKind.Custom;
 
                     // back check: if the "body" is actually just a hand-written return, then - false alarm!
                     var returnStmt = getter.Body.Statements[0] as ReturnStatementSyntax;
-                    if (returnStmt != null && returnStmt.Expression is IdentifierNameSyntax)
+                    if (returnStmt != null)
                     {
                         var ptyName = pty.Identifier.Text;
-                        var identifier = (returnStmt.Expression as IdentifierNameSyntax).Identifier.Text;
 
-                        if(string.Compare(identifier, "_" + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
-                            hasCustomGetter = false;
+                        if (returnStmt.Expression is IdentifierNameSyntax)
+                        {
+                            var identifier = (returnStmt.Expression as IdentifierNameSyntax).Identifier.Text;
+                            if (string.Compare(identifier, "_" + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
+                                getterKind = AccessorKind.BackingField;
+                        }
+                        else if (returnStmt.Expression is MemberAccessExpressionSyntax)
+                        {
+                            var exprText = returnStmt.Expression.ToString();
+                            if (string.Compare(exprText, "_model." + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
+                                getterKind = AccessorKind.ModelProxy;
+                        }
                     }
                 }
+
+                var setterKind = setter != null && !setter.Modifiers.Any(x => x.Kind() == SyntaxKind.PrivateKeyword)
+                    ? AccessorKind.BackingField
+                    : (AccessorKind?) null;
 
                 yield return new PropertyModel
                 {
                     Type = pty.Type.ToString(),
                     Name = pty.Identifier.Text,
-                    HasSetter = setter != null && !setter.Modifiers.Any(x => x.Kind() == SyntaxKind.PrivateKeyword),
-                    HasСustomSetter = setter != null && setter.Body != null,
-                    HasСustomGetter = hasCustomGetter,
+                    Getter = getterKind,
+                    Setter = setterKind,
                     Comment = ParseComment(pty)
                 };
             }
@@ -341,8 +353,9 @@
             return name;
         }
 
-        private readonly Regex ListTypeConvention = new Regex(@"^List<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
+        private readonly Regex ListTypeConvention = new Regex(@"^(List|ObservableCollection)<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
         private readonly Regex SubjectTypeConvention = new Regex(@"^Subject<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
+        private readonly Regex CommandTypeConvention = new Regex(@"^(Relay|I)Command(<(?<name>.+)>)?$", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
         private readonly Regex GenericTypeConvention = new Regex(@"^(?<type>[a-z][a-z0-9]*)<(?<name>.+)>$", RegexOptions.Compiled | RegexOptions.ExplicitCapture | RegexOptions.IgnoreCase);
         private readonly Regex InitializerNewObjectConvention = new Regex(@"new (?<type>.+)\s*\((?<args>.*)\)", RegexOptions.Compiled | RegexOptions.ExplicitCapture);
 
@@ -352,8 +365,11 @@
             { "long", "number" },
             { "float", "number" },
             { "double", "number" },
+            { "uint", "number" },
+            { "ulong", "number" },
             { "object", "any" },
             { "bool", "boolean" },
+            { "bitmap", "string" }
         };
 
         /// <summary>
@@ -361,10 +377,12 @@
         /// </summary>
         private string ApplyTypeConvention(string type, bool useInterface = true)
         {
-            if(type != null)
-                type = type.Trim();
+            type = type.Trim();
 
-            if (BasicTypes.ContainsKey(type))
+            if (type.EndsWith("ViewModel"))
+                type = type.Substring(0, type.Length - "ViewModel".Length) + "VM";
+
+            if (BasicTypes.ContainsKey(type.ToLower().TrimEnd('?')))
                 return BasicTypes[type];
 
             var listMatch = ListTypeConvention.Match(type);
@@ -373,14 +391,26 @@
 
             var subjectMatch = SubjectTypeConvention.Match(type);
             if (subjectMatch.Success)
-                return (useInterface ? "I" : "") + "Observable<" + ApplyTypeConvention(subjectMatch.Groups["name"].Value) + ">";
+                return string.Format(
+                    "{0}Observable<{1}>",
+                    (useInterface ? "I" : ""),
+                    ApplyTypeConvention(subjectMatch.Groups["name"].Value)
+                );
+
+            var commandMatch = CommandTypeConvention.Match(type);
+            if (commandMatch.Success)
+            {
+                var commandType = commandMatch.Groups["name"].Value;
+                commandType = string.IsNullOrEmpty(commandType) ? "any" : ApplyTypeConvention(commandType);
+                return string.Format("Command<{0}>", commandType);
+            }
 
             var genericMatch = GenericTypeConvention.Match(type);
             if (genericMatch.Success)
                 return string.Format(
                     "{0}<{1}>",
                     ApplyTypeConvention(genericMatch.Groups["type"].Value),
-                    string.Join(", ", genericMatch.Groups["name"].Value.Split(',').Select(x => ApplyTypeConvention(x, useInterface)))
+                    genericMatch.Groups["name"].Value.Split(',').Select(x => ApplyTypeConvention(x, useInterface)).Join(", ")
                 );
 
             return type;
@@ -393,7 +423,11 @@
         {
             var initMatch = InitializerNewObjectConvention.Match(value);
             if (initMatch.Success)
-                return string.Format("new {0}({1})", ApplyTypeConvention(initMatch.Groups["type"].Value, false), initMatch.Groups["args"].Value);
+                return string.Format(
+                    "new {0}({1})",
+                    ApplyTypeConvention(initMatch.Groups["type"].Value, false),
+                    initMatch.Groups["args"].Value
+                );
 
             return value;
         }
@@ -412,11 +446,11 @@
             using (var line = sb.Line())
             {
                 // class <X> [extends <Y>] [implements <Z1, Z2, ...>] {
-                line.Append("class {0}", model.Name);
+                line.Append("class {0}", ApplyTypeConvention(model.Name));
                 if (!string.IsNullOrEmpty(model.BaseType))
-                    line.Append("extends {0}", model.BaseType);
+                    line.Append("extends {0}", ApplyTypeConvention(model.BaseType));
                 if (model.Interfaces.Any())
-                    line.Append("implements {0}", string.Join(", ", model.Interfaces));
+                    line.Append("implements {0}", model.Interfaces.Select(x => ApplyTypeConvention(x, true)).Join(", "));
             }
 
             using (sb.NestedBlock())
@@ -495,7 +529,7 @@
                 {
                     var baseCallArgs = model.Constructor.BaseCall.Select(x => x.Name);
                     using(sb.SpacedBlock())
-                        sb.Append("super({0});", string.Join(", ", baseCallArgs));
+                        sb.Append("super({0});", baseCallArgs.Join(", "));
                 }
 
                 // contract
@@ -549,14 +583,16 @@
                         using(sb.SpacedBlock())
                         sb.Append(comment);
 
-                        if (pty.HasСustomGetter)
+                        if (pty.Getter == AccessorKind.Custom)
                             sb.Append("// TODO: getter body");
-                        else
+                        else if(pty.Getter == AccessorKind.BackingField)
                             sb.Append("return this.{0};", ApplyNameConvention(pty.Name, true));
+                        else if (pty.Getter == AccessorKind.ModelProxy)
+                            sb.Append("return this._model.{0};", ApplyNameConvention(pty.Name, false));
                     }
                 }
 
-                if (pty.HasSetter)
+                if (pty.Setter.HasValue)
                 {
                     using (sb.SpacedBlock())
                     {
@@ -566,7 +602,7 @@
                             using(sb.SpacedBlock())
                                 sb.Append(comment);
 
-                            if (pty.HasСustomSetter)
+                            if (pty.Setter == AccessorKind.Custom)
                             {
                                 AppendContractAssertionsBlock(sb, pty.SetterContractAssertions);
 
@@ -622,7 +658,7 @@
         /// </summary>
         private void AppendMethods(SourceBuilder sb, ClassModel model)
         {
-            var restrictedNames = new[] { "Dispose", "Equals", "GetHashCode", "ObjectInvariant" };
+            var restrictedNames = new[] { "Dispose", "Equals", "GetHashCode", "ObjectInvariant", "Cleanup" };
             var restrictions = new Func<MethodModel, bool>[]{ x => restrictedNames.Contains(x.Name) };
             var methods = model.Methods.Restrict(restrictions)
                                .GroupBy(x => x.IsPrivate && x.Type == "void" && x.Arguments.Count == 1)
@@ -676,7 +712,7 @@
         /// </summary>
         private void AppendDisposableBlock(SourceBuilder sb, ClassModel model)
         {
-            if (!model.Interfaces.Contains("IDisposable"))
+            if (!model.Interfaces.Contains("IDisposable") && !model.Methods.Any(x => x.Name == "Cleanup"))
                 return;
 
             sb.AppendRegionHeader("IDisposable implementation");
@@ -776,15 +812,14 @@
         /// </summary>
         private string BuildArgumentList(IEnumerable<ArgumentModel> args)
         {
-            var argStrings = args.Select(x => string.Format(
+            return args.Select(x => string.Format(
                 "{0}: {1}{2}",
                 x.Name,
                 ApplyTypeConvention(x.Type),
                 string.IsNullOrEmpty(x.InitializerCode)
                     ? ""
                     : " = " + ApplyInitializerConvention(x.InitializerCode)
-            ));
-            return string.Join(", ", argStrings);
+            )).Join(", ");
         }
 
         #endregion

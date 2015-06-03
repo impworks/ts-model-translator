@@ -16,5 +16,13 @@ namespace ModelTranslator.Utils
         {
             return source.Where(item => !restrictions.Any(fx => fx(item)));
         }
+
+        /// <summary>
+        /// Extension joiner.
+        /// </summary>
+        public static string Join(this IEnumerable<string> values, string separator = "")
+        {
+            return string.Join(separator, values);
+        }
     }
 }

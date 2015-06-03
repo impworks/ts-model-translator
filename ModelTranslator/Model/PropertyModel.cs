@@ -8,9 +8,15 @@
         public string Name { get; set; }
         public string Type { get; set; }
 
-        public bool HasSetter { get; set; }
-        public bool HasСustomSetter { get; set; }
-        public bool HasСustomGetter { get; set; }
+        public AccessorKind? Getter { get; set; }
+        public AccessorKind? Setter { get; set; }
         public List<ContractAssertionModel> SetterContractAssertions { get; set; }
+    }
+
+    enum AccessorKind
+    {
+        BackingField,
+        ModelProxy,
+        Custom
     }
 }
