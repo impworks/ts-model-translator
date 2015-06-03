@@ -369,7 +369,8 @@
             { "ulong", "number" },
             { "object", "any" },
             { "bool", "boolean" },
-            { "bitmap", "string" }
+            { "bitmap", "string" },
+            { "bitmapimage", "string" }
         };
 
         /// <summary>
@@ -382,8 +383,9 @@
             if (type.EndsWith("ViewModel"))
                 type = type.Substring(0, type.Length - "ViewModel".Length) + "VM";
 
-            if (BasicTypes.ContainsKey(type.ToLower().TrimEnd('?')))
-                return BasicTypes[type];
+            var basic = type.ToLower().TrimEnd('?');
+            if(BasicTypes.ContainsKey(basic))
+                return BasicTypes[basic];
 
             var listMatch = ListTypeConvention.Match(type);
             if (listMatch.Success)
