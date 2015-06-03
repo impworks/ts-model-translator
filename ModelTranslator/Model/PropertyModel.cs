@@ -8,8 +8,8 @@
         public string Name { get; set; }
         public string Type { get; set; }
 
-        public AccessorKind? Getter { get; set; }
-        public AccessorKind? Setter { get; set; }
+        public AccessorKind? GetterKind { get; set; }
+        public AccessorKind? SetterKind { get; set; }
         public List<ContractAssertionModel> SetterContractAssertions { get; set; }
     }
 

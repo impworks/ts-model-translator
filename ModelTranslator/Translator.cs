@@ -99,30 +99,44 @@
                 var getter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.GetKeyword);
                 var setter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.SetKeyword);
 
-                AccessorKind? getterKind = null;
-                if (getter != null && getter.Body != null && getter.Body.Statements.Count == 1)
+                AccessorKind? getterKind;
+                if (getter != null)
                 {
-                    getterKind = AccessorKind.Custom;
-
-                    // back check: if the "body" is actually just a hand-written return, then - false alarm!
-                    var returnStmt = getter.Body.Statements[0] as ReturnStatementSyntax;
-                    if (returnStmt != null)
+                    if (getter.Body == null)
                     {
-                        var ptyName = pty.Identifier.Text;
+                        getterKind = AccessorKind.BackingField;
+                    }
+                    else
+                    {
+                        getterKind = AccessorKind.Custom;
 
-                        if (returnStmt.Expression is IdentifierNameSyntax)
+                        if (getter.Body.Statements.Count == 1)
                         {
-                            var identifier = (returnStmt.Expression as IdentifierNameSyntax).Identifier.Text;
-                            if (string.Compare(identifier, "_" + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
-                                getterKind = AccessorKind.BackingField;
-                        }
-                        else if (returnStmt.Expression is MemberAccessExpressionSyntax)
-                        {
-                            var exprText = returnStmt.Expression.ToString();
-                            if (string.Compare(exprText, "_model." + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
-                                getterKind = AccessorKind.ModelProxy;
+                            // back check: if the "body" is actually just a hand-written return, then - false alarm!
+                            var returnStmt = getter.Body.Statements[0] as ReturnStatementSyntax;
+                            if (returnStmt != null)
+                            {
+                                var ptyName = pty.Identifier.Text;
+
+                                if (returnStmt.Expression is IdentifierNameSyntax)
+                                {
+                                    var identifier = (returnStmt.Expression as IdentifierNameSyntax).Identifier.Text;
+                                    if (string.Compare(identifier, "_" + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
+                                        getterKind = AccessorKind.BackingField;
+                                }
+                                else if (returnStmt.Expression is MemberAccessExpressionSyntax)
+                                {
+                                    var exprText = returnStmt.Expression.ToString();
+                                    if (string.Compare(exprText, "_model." + ptyName, StringComparison.InvariantCultureIgnoreCase) == 0)
+                                        getterKind = AccessorKind.ModelProxy;
+                                }
+                            }
                         }
                     }
+                }
+                else
+                {
+                    getterKind = null;
                 }
 
                 var setterKind = setter != null && !setter.Modifiers.Any(x => x.Kind() == SyntaxKind.PrivateKeyword)
@@ -133,8 +147,8 @@
                 {
                     Type = pty.Type.ToString(),
                     Name = pty.Identifier.Text,
-                    Getter = getterKind,
-                    Setter = setterKind,
+                    GetterKind = getterKind,
+                    SetterKind = setterKind,
                     Comment = ParseComment(pty)
                 };
             }
@@ -380,6 +394,12 @@
         {
             type = type.Trim();
 
+            if (type == "ViewableContentModel" || type == "ViewableContentViewModel")
+                return "ViewableContent";
+
+            if (type == "ViewModelBase")
+                return "NotifierVMBase";
+
             if (type.EndsWith("ViewModel"))
                 type = type.Substring(0, type.Length - "ViewModel".Length) + "VM";
 
@@ -479,12 +499,12 @@
         private void AppendFields(SourceBuilder sb, ClassModel model)
         {
             // add backing fields for properties
-            var fieldsLookup = model.Fields.ToDictionary(x => x.Name, x => x);
+            var fieldsLookup = model.Fields.ToDictionary(x => ApplyNameConvention(x.Name, true), x => x);
             foreach (var pty in model.Properties)
             {
                 var name = ApplyNameConvention(pty.Name, true);
                 if(!fieldsLookup.ContainsKey(name))
-                    fieldsLookup.Add(name, new FieldModel { Name = pty.Name, Type = pty.Type, Comment = pty.Comment });
+                    fieldsLookup.Add(name, new FieldModel { Name = name, Type = ApplyTypeConvention(pty.Type), Comment = pty.Comment });
             }
 
             var restrictions = new Func<FieldModel, bool>[] { x => x.Name == "_isDisposed", x => x.Type == "ILogService" };
@@ -527,9 +547,10 @@
                     sb.Append(CleanUpComment(model.Constructor.Comment, restrictedArgs));
 
                 // base call
-                if (model.Constructor.BaseCall.Count > 0)
+                if (model.BaseType != null || model.Constructor.BaseCall.Count > 0)
                 {
-                    var baseCallArgs = model.Constructor.BaseCall.Select(x => x.Name);
+                    var baseCall = model.Constructor.BaseCall;
+                    var baseCallArgs = baseCall != null ? baseCall.Select(x => x.Name) : new string[0];
                     using(sb.SpacedBlock())
                         sb.Append("super({0});", baseCallArgs.Join(", "));
                 }
@@ -585,16 +606,18 @@
                         using(sb.SpacedBlock())
                         sb.Append(comment);
 
-                        if (pty.Getter == AccessorKind.Custom)
+                        if (pty.GetterKind == AccessorKind.Custom)
                             sb.Append("// TODO: getter body");
-                        else if(pty.Getter == AccessorKind.BackingField)
+                        else if(pty.GetterKind == AccessorKind.BackingField)
                             sb.Append("return this.{0};", ApplyNameConvention(pty.Name, true));
-                        else if (pty.Getter == AccessorKind.ModelProxy)
+                        else if (pty.GetterKind == AccessorKind.ModelProxy)
                             sb.Append("return this._model.{0};", ApplyNameConvention(pty.Name, false));
+                        else
+                            throw new Exception("Unknown getter type!");
                     }
                 }
 
-                if (pty.Setter.HasValue)
+                if (pty.SetterKind.HasValue)
                 {
                     using (sb.SpacedBlock())
                     {
@@ -604,7 +627,7 @@
                             using(sb.SpacedBlock())
                                 sb.Append(comment);
 
-                            if (pty.Setter == AccessorKind.Custom)
+                            if (pty.SetterKind == AccessorKind.Custom)
                             {
                                 AppendContractAssertionsBlock(sb, pty.SetterContractAssertions);
 
@@ -750,7 +773,7 @@
 
             sb.AppendRegionHeader("IEquatable implementation");
 
-            sb.Append("equals(other: {0})", model.Name);
+            sb.Append("equals(other: {0}) : boolean", model.Name);
             using (sb.NestedBlock())
             {
                 sb.Append("// TODO: implement comparator here");
