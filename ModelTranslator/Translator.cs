@@ -99,7 +99,7 @@
                 var getter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.GetKeyword);
                 var setter = accessors.FirstOrDefault(x => x.Keyword.Kind() == SyntaxKind.SetKeyword);
 
-                AccessorKind? getterKind;
+                AccessorKind? getterKind = null;
                 if (getter != null)
                 {
                     if (getter.Body == null)
@@ -134,14 +134,14 @@
                         }
                     }
                 }
-                else
-                {
-                    getterKind = null;
-                }
 
-                var setterKind = setter != null && !setter.Modifiers.Any(x => x.Kind() == SyntaxKind.PrivateKeyword)
-                    ? AccessorKind.BackingField
-                    : (AccessorKind?) null;
+                AccessorKind? setterKind = null;
+                if (setter != null)
+                {
+                    setterKind = setter.Modifiers.Any(x => x.Kind() == SyntaxKind.PrivateKeyword)
+                        ? AccessorKind.BackingField
+                        : AccessorKind.Custom;
+                }
 
                 yield return new PropertyModel
                 {
@@ -445,11 +445,17 @@
         {
             var initMatch = InitializerNewObjectConvention.Match(value);
             if (initMatch.Success)
+            {
+                var type = initMatch.Groups["type"].Value;
+                if (ListTypeConvention.IsMatch(type))
+                    return "[]";
+
                 return string.Format(
                     "new {0}({1})",
                     ApplyTypeConvention(initMatch.Groups["type"].Value, false),
                     initMatch.Groups["args"].Value
                 );
+            }
 
             return value;
         }
